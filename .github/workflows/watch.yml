@@ -14,7 +14,7 @@ concurrency:
 
 env:
   # ▼▼▼ 여기만 수정하면 됩니다 ▼▼▼
-  MOVIE_KEYWORD: "스파이더맨"                                  # 감시할 영화 제목 (공백·더빙 등 변형도 자동으로 잡힘)
+  MOVIE_KEYWORD: "아바타"                                  # 감시할 영화 제목 (공백·더빙 등 변형도 자동으로 잡힘)
   THEATER_URL: "https://cgv.co.kr/reserve/show-times/"     # CGV에서 극장 선택 후 복사한 주소
   THEATER_NAME: "용산아이파크몰"                            # 주소에 극장 정보가 없을 때 페이지에서 눌러볼 극장 이름
   CHECK_EVERY_SEC: "30"                                    # 확인 간격(초) — 너무 줄이면 차단 위험
