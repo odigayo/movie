@@ -39,7 +39,7 @@ jobs:
       - name: Watch CGV
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-        run: python check_cgv.py
+        run: python -u check_cgv.py
 
       - name: Save state
         if: always()
