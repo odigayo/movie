@@ -37,11 +37,20 @@ MOVIE_NORM = "".join(_norm_char(c) for c in MOVIE_RAW if not c.isspace())
 
 def send_telegram(text: str) -> None:
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             data={"chat_id": CHAT_ID, "text": text},
             timeout=15,
         )
+        body = r.text[:200]
+        if r.status_code == 200:
+            print("텔레그램 전송 성공")
+        elif r.status_code == 401:
+            print("텔레그램 실패(401): 토큰이 잘못됨 — Secrets의 TELEGRAM_TOKEN 재등록 필요 /", body)
+        elif r.status_code in (400, 403):
+            print("텔레그램 실패: chat_id가 잘못됐거나 봇에게 /start를 안 보낸 상태 /", body)
+        else:
+            print("텔레그램 실패:", r.status_code, body)
     except Exception as e:
         print("텔레그램 전송 실패:", type(e).__name__)
 
@@ -137,6 +146,8 @@ def main() -> None:
             f"약 {CHECK_EVERY_SEC}초 간격으로 계속 확인하다가 회차가 열리면 바로 알릴게요."
         )
         save_seen(seen)
+    else:
+        send_telegram(f"🔎 CGV 감시 작동 중 — {MOVIE_RAW} (감시 작업이 새로 시작될 때마다 오는 확인 메시지예요)")
 
     deadline = time.time() + RUN_MINUTES * 60
     print(f"감시 루프 시작: '{MOVIE_RAW}' / {CHECK_EVERY_SEC}초 간격 / {RUN_MINUTES}분간")
