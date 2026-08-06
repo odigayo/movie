@@ -36,23 +36,26 @@ MOVIE_NORM = "".join(_norm_char(c) for c in MOVIE_RAW if not c.isspace())
 
 
 def send_telegram(text: str) -> None:
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": text},
-            timeout=15,
-        )
-        body = r.text[:200]
-        if r.status_code == 200:
-            print("텔레그램 전송 성공")
-        elif r.status_code == 401:
-            print("텔레그램 실패(401): 토큰이 잘못됨 — Secrets의 TELEGRAM_TOKEN 재등록 필요 /", body)
-        elif r.status_code in (400, 403):
-            print("텔레그램 실패: chat_id가 잘못됐거나 봇에게 /start를 안 보낸 상태 /", body)
-        else:
-            print("텔레그램 실패:", r.status_code, body)
-    except Exception as e:
-        print("텔레그램 전송 실패:", type(e).__name__)
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                data={"chat_id": CHAT_ID, "text": text},
+                timeout=30,
+            )
+            body = r.text[:200]
+            if r.status_code == 200:
+                print("텔레그램 전송 성공")
+            elif r.status_code == 401:
+                print("텔레그램 실패(401): 토큰이 잘못됨 — Secrets의 TELEGRAM_TOKEN 재등록 필요 /", body)
+            elif r.status_code in (400, 403):
+                print("텔레그램 실패: chat_id가 잘못됐거나 봇에게 /start를 안 보낸 상태 /", body)
+            else:
+                print("텔레그램 실패:", r.status_code, body)
+            return
+        except Exception as e:
+            print(f"텔레그램 전송 실패({attempt + 1}/3):", type(e).__name__)
+            time.sleep(3)
 
 
 async def collect_text() -> str:
