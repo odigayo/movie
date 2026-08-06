@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""CGV 예매 오픈 감시 — 버전 7 (이번 주·다음 주 금토일만 감시 + 요일 표시)
+"""CGV 예매 오픈 감시 — 버전 9 (CGV 실제 필드 scnYmd/scnsrtTm 직접 파싱)
 
 오늘은 제외하고, 이번 주와 다음 주 중 TARGET_WEEKDAYS(기본: 금,토,일)에
 해당하는 날짜 탭만 눌러 데이터를 수집·감시한다.
@@ -11,7 +11,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 from playwright.async_api import async_playwright
@@ -38,7 +38,7 @@ WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
 
 
 def kst_now() -> datetime:
-    return datetime.utcnow() + timedelta(hours=9)
+    return datetime.now(timezone.utc) + timedelta(hours=9)
 
 
 def target_dates() -> list:
@@ -180,7 +180,30 @@ async def collect_text(dates: list, verbose: bool = False) -> list:
             if verbose:
                 print("클릭 성공:" if ok else "클릭 실패:", label)
 
-        # 감시 대상 날짜 탭을 순서대로 눌러 데이터 수집
+        # 날짜를 주소에 직접 넣어 재접속 (탭 클릭 실패 보완)
+        base = URL.split("?")[0]
+        for d in dates:
+            ymd = f"{d.year}{d.month:02d}{d.day:02d}"
+            for cand in (f"{base}?scnYmd={ymd}", f"{base}?date={ymd}"):
+                try:
+                    await page.goto(cand, wait_until="domcontentloaded", timeout=45000)
+                    await page.wait_for_timeout(4000)
+                except Exception:
+                    pass
+            if verbose:
+                print("날짜 직접 요청:", date_label(d))
+
+        try:
+            await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(5000)
+            for label in ("서울", THEATER_NAME):
+                if label:
+                    await try_click(label)
+                    await page.wait_for_timeout(2500)
+        except Exception:
+            pass
+
+        # 감시 대상 날짜 탭도 순서대로 눌러 데이터 수집
         for d in dates:
             day = d.day
             try:
@@ -252,6 +275,38 @@ def norm_hall_kv(key: str, val):
     return None
 
 
+CGV_DATE_KEYS = ("scnYmd", "scnymd", "playYmd", "scnDe")
+CGV_TIME_KEYS = ("scnsrtTm", "scnsrttm", "playStrTm", "scnStrTm")
+CGV_HALL_KEYS = ("expoScnsNm", "scnsNm", "exposcnsnm", "scnsnm")
+CGV_TITLE_KEYS = ("prodNm", "expoProdNm", "movieNm", "prodnm")
+
+
+def cgv_scan(dct: dict):
+    """CGV 상영 항목에서 (시간, 날짜, 상영관)을 직접 읽는다."""
+    def pick(keys):
+        for k in keys:
+            if k in dct and isinstance(dct[k], (str, int)):
+                return str(dct[k]).strip()
+        low = {kk.lower(): vv for kk, vv in dct.items()}
+        for k in keys:
+            v = low.get(k.lower())
+            if isinstance(v, (str, int)):
+                return str(v).strip()
+        return None
+
+    raw_d, raw_t, hall = pick(CGV_DATE_KEYS), pick(CGV_TIME_KEYS), pick(CGV_HALL_KEYS)
+    dt = t = None
+    if raw_d:
+        m = re.fullmatch(r"(20\d{2})[-./]?(\d{2})[-./]?(\d{2})", raw_d)
+        if m:
+            dt = f"{int(m.group(2))}/{int(m.group(3))}"
+    if raw_t:
+        m = re.fullmatch(r"(\d{1,2}):?(\d{2})(:\d{2})?", raw_t)
+        if m and int(m.group(1)) < 24:
+            t = f"{int(m.group(1)):02d}:{m.group(2)}"
+    return t, dt, (hall or None)
+
+
 def field_scan(dct: dict):
     t = dt = hall = None
     for k, v in dct.items():
@@ -282,6 +337,27 @@ def collect_screenings(data) -> set:
 
     walk(data)
     triples = set()
+
+    # CGV 실제 필드가 있는 항목을 직접 수집 (가장 정확)
+    def walk_cgv(node):
+        if isinstance(node, dict):
+            title = ""
+            for k in CGV_TITLE_KEYS:
+                v = node.get(k)
+                if isinstance(v, str):
+                    title += " " + v
+            t, dt, hall = cgv_scan(node)
+            if t and title and kw_in(title):
+                triples.add((dt or "", hall or "", t))
+            for v in node.values():
+                walk_cgv(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk_cgv(v)
+
+    walk_cgv(data)
+    if triples:
+        return triples
 
     def units_of(d):
         us = []
