@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""CGV 예매 오픈 감시 (GitHub Actions용, 상시 실행 버전)
+"""CGV 예매 오픈 감시 — 버전 3 (진단 모드 포함)
 
 작업이 시작되면 약 3시간 45분 동안 계속 돌면서 CHECK_EVERY_SEC초마다
 CGV 페이지를 확인하고, 영화 키워드의 새 회차가 발견되는 즉시 텔레그램으로 알린다.
@@ -58,7 +58,7 @@ def send_telegram(text: str) -> None:
             time.sleep(3)
 
 
-async def collect_text() -> str:
+async def collect_text(verbose: bool = False) -> str:
     """페이지를 렌더링하면서 오가는 데이터(JSON 응답 + 화면 텍스트)를 전부 수집."""
     chunks = []
     async with async_playwright() as p:
@@ -209,10 +209,12 @@ def main() -> None:
     deadline = time.time() + RUN_MINUTES * 60
     print(f"감시 루프 시작: '{MOVIE_RAW}' / {CHECK_EVERY_SEC}초 간격 / {RUN_MINUTES}분간")
 
+    loop_no = 0
     while time.time() < deadline:
         t0 = time.time()
         try:
-            text = asyncio.run(collect_text())
+            text = asyncio.run(collect_text(verbose=(loop_no == 0)))
+            loop_no += 1
             positions = find_keyword_positions(text)
             stamp = time.strftime("%H:%M:%S")
             if positions:
