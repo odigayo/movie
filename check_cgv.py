@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
-"""CGV 예매 오픈 감시 — 버전 6 (일주일치 날짜 순회 + JSON 구조 파싱)
+"""CGV 예매 오픈 감시 — 버전 7 (이번 주·다음 주 금토일만 감시 + 요일 표시)
 
-네트워크로 오가는 JSON 데이터에서 영화가 언급된 항목을 찾아
-회차 단위로 (날짜, 상영관, 시간)을 정확히 추출한다.
-JSON 파싱이 실패하면 기존 텍스트 방식(시간만)으로 폴백.
-알림은 날짜 → 상영관별 시간으로 묶어서 보기 좋게 전송.
+오늘은 제외하고, 이번 주와 다음 주 중 TARGET_WEEKDAYS(기본: 금,토,일)에
+해당하는 날짜 탭만 눌러 데이터를 수집·감시한다.
+회차는 JSON 구조 파싱으로 (날짜, 상영관, 시간)을 정확히 추출하고,
+알림은 날짜(요일) → 상영관별 시간으로 묶어서 전송한다.
 """
 import asyncio
 import json
-from datetime import datetime, timedelta
 import os
 import re
 import time
+from datetime import datetime, timedelta
 
 import requests
 from playwright.async_api import async_playwright
@@ -23,6 +23,7 @@ TOKEN = os.environ["TELEGRAM_TOKEN"].strip()
 CHAT_ID = os.environ["CHAT_ID"].strip()
 CHECK_EVERY_SEC = int(os.environ.get("CHECK_EVERY_SEC", "30"))
 RUN_MINUTES = int(os.environ.get("RUN_MINUTES", "225"))
+WEEKDAYS_RAW = os.environ.get("TARGET_WEEKDAYS", "금,토,일")
 STATE_FILE = "seen.json"
 
 TIME_RE = re.compile(r"(?<!\d)(?:[01]?\d|2[0-3]):[0-5]\d(?!\d)")
@@ -33,6 +34,32 @@ HALL_RE = re.compile(
 TIME_KEY = re.compile(r"(time|tm)", re.I)
 DATE_KEY = re.compile(r"(date|ymd|day|dt)", re.I)
 HALL_KEY = re.compile(r"(scr|screen|theab|hall|room)", re.I)
+WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
+
+
+def kst_now() -> datetime:
+    return datetime.utcnow() + timedelta(hours=9)
+
+
+def target_dates() -> list:
+    """오늘 제외, 이번 주~다음 주 일요일까지 중 지정 요일만."""
+    today = kst_now().date()
+    wanted = {
+        WEEKDAY_KO.index(w.strip())
+        for w in WEEKDAYS_RAW.split(",")
+        if w.strip() in WEEKDAY_KO
+    }
+    end = today + timedelta(days=(6 - today.weekday()) + 7)  # 다음 주 일요일
+    out, d = [], today + timedelta(days=1)
+    while d <= end:
+        if d.weekday() in wanted:
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def date_label(d) -> str:
+    return f"{d.month}/{d.day}({WEEKDAY_KO[d.weekday()]})"
 
 
 def _norm_char(ch: str) -> str:
@@ -94,7 +121,7 @@ def send_telegram(text: str) -> None:
 
 
 # ---------- 페이지 수집 ----------
-async def collect_text(verbose: bool = False) -> list:
+async def collect_text(dates: list, verbose: bool = False) -> list:
     chunks = []
     async with async_playwright() as p:
         browser = await p.chromium.launch()
@@ -109,7 +136,7 @@ async def collect_text(verbose: bool = False) -> list:
         async def grab(res):
             try:
                 ct = res.headers.get("content-type", "")
-                if ("json" in ct or "text" in ct) and len(chunks) < 300:
+                if ("json" in ct or "text" in ct) and len(chunks) < 400:
                     chunks.append(await res.text())
             except Exception:
                 pass
@@ -121,15 +148,6 @@ async def collect_text(verbose: bool = False) -> list:
             print("접속 후 URL:", page.url)
             try:
                 print("페이지 제목:", await page.title())
-            except Exception:
-                pass
-            try:
-                labels = await page.eval_on_selector_all(
-                    "button, a, li, [role=button]",
-                    "els => [...new Set(els.map(e => (e.innerText || '').trim())"
-                    ".filter(t => t && t.length <= 15))].slice(0, 60)",
-                )
-                print("클릭 가능한 항목들:", labels)
             except Exception:
                 pass
 
@@ -162,11 +180,9 @@ async def collect_text(verbose: bool = False) -> list:
             if verbose:
                 print("클릭 성공:" if ok else "클릭 실패:", label)
 
-        # 내일부터 (DAYS_AHEAD-1)일치 날짜 탭을 순서대로 눌러 데이터 수집
-        days_ahead = int(os.environ.get("DAYS_AHEAD", "7"))
-        kst_today = datetime.utcnow() + timedelta(hours=9)
-        for i in range(1, days_ahead):
-            day = (kst_today + timedelta(days=i)).day
+        # 감시 대상 날짜 탭을 순서대로 눌러 데이터 수집
+        for d in dates:
+            day = d.day
             try:
                 clicked = await page.evaluate(
                     """(day) => {
@@ -175,7 +191,7 @@ async def collect_text(verbose: bool = False) -> list:
                             const t = (e.innerText || '').trim().replace(/\\s+/g, '');
                             if (!t || t.length > 4) return false;
                             const digits = t.replace(/[^0-9]/g, '');
-                            return digits === String(day) && /^[\uc77c\uc6d4\ud654\uc218\ubaa9\uae08\ud1a0]?\\d{1,2}[\uc77c\uc6d4\ud654\uc218\ubaa9\uae08\ud1a0]?$/.test(t);
+                            return digits === String(day) && /^[\\uc77c\\uc6d4\\ud654\\uc218\\ubaa9\\uae08\\ud1a0]?\\d{1,2}[\\uc77c\\uc6d4\\ud654\\uc218\\ubaa9\\uae08\\ud1a0]?$/.test(t);
                         });
                         if (!cands.length) return false;
                         cands.sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
@@ -186,23 +202,14 @@ async def collect_text(verbose: bool = False) -> list:
                 )
                 await page.wait_for_timeout(3500)
                 if verbose:
-                    print("날짜 탭 클릭:", day, "성공" if clicked else "실패")
+                    print("날짜 탭 클릭:", date_label(d), "성공" if clicked else "실패(탭 없음일 수 있음)")
             except Exception as e:
                 if verbose:
-                    print("날짜 탭 클릭 오류:", day, type(e).__name__)
-
-        try:
-            await page.mouse.wheel(0, 3000)
-            await page.wait_for_timeout(2000)
-        except Exception:
-            pass
+                    print("날짜 탭 클릭 오류:", date_label(d), type(e).__name__)
 
         try:
             body = await page.evaluate("document.body.innerText")
             chunks.append(body)
-            if verbose:
-                preview = " ".join(body.split())[:400]
-                print("화면 텍스트 미리보기:", preview if preview else "(비어 있음)")
         except Exception:
             pass
         await browser.close()
@@ -297,15 +304,15 @@ def collect_screenings(data) -> set:
 
     for d in matched:
         p_t, p_dt, p_hall = field_scan(d)
-        for u in units_of(d):
+        us = units_of(d)
+        for u in us:
             t, dt, hall = field_scan(u)
             if t is None:
                 continue
             triples.add((dt or p_dt or "", hall or p_hall or "", t))
-        if not units_of(d) and p_t:
+        if not us and p_t:
             triples.add((p_dt or "", p_hall or "", p_t))
 
-    # 영화 코드로 상영 항목을 찾는 2차 시도
     if not triples and matched:
         codes = set()
         for d in matched:
@@ -376,31 +383,40 @@ def main() -> None:
     first_run = not os.path.exists(STATE_FILE)
     seen = load_seen()
 
+    targets_now = target_dates()
+    target_str = ", ".join(date_label(d) for d in targets_now)
     if first_run:
         send_telegram(
             f"✅ CGV 감시 시작!\n영화: {MOVIE_RAW}\n"
-            f"약 {CHECK_EVERY_SEC}초 간격으로 계속 확인하다가 변화가 생기면 바로 알릴게요."
+            f"감시 날짜(이번 주·다음 주 {WEEKDAYS_RAW}): {target_str}\n"
+            f"변화가 생기면 바로 알릴게요."
         )
         save_seen(seen)
     else:
-        send_telegram(f"🔎 CGV 감시 작동 중 — {MOVIE_RAW} (감시 작업 재시작 알림)")
+        send_telegram(f"🔎 CGV 감시 작동 중 — {MOVIE_RAW} / {target_str}")
 
     deadline = time.time() + RUN_MINUTES * 60
-    print(f"감시 루프 시작: '{MOVIE_RAW}' / {CHECK_EVERY_SEC}초 간격 / {RUN_MINUTES}분간")
+    print(f"감시 루프 시작: '{MOVIE_RAW}' / 대상: {target_str}")
 
     loop_no = 0
     while time.time() < deadline:
         t0 = time.time()
         first_iter = loop_no == 0
         try:
-            chunks = asyncio.run(collect_text(verbose=first_iter))
+            targets = target_dates()
+            allowed = {f"{d.month}/{d.day}" for d in targets}
+            label_map = {f"{d.month}/{d.day}": date_label(d) for d in targets}
+            if first_iter:
+                print("감시 대상 날짜:", ", ".join(label_map.values()))
+
+            chunks = asyncio.run(collect_text(targets, verbose=first_iter))
             loop_no += 1
             full_text = "\n".join(chunks)
             positions = find_keyword_positions(full_text)
             stamp = time.strftime("%H:%M:%S")
 
             if positions:
-                triples = set()
+                raw_triples = set()
                 for c in chunks:
                     if c.lstrip()[:1] not in "[{" or not kw_in(c):
                         continue
@@ -408,25 +424,23 @@ def main() -> None:
                         data = json.loads(c)
                     except Exception:
                         continue
-                    triples |= collect_screenings(data)
-                used_json = bool(triples)
+                    raw_triples |= collect_screenings(data)
 
-                if not triples:  # 폴백: 텍스트 창에서 시간만
-                    for p in positions:
-                        window = full_text[max(0, p - 600): p + 600]
-                        for t in TIME_RE.findall(window):
-                            triples.add(("", "", t))
-
+                triples = {
+                    (label_map[dt], hall, t)
+                    for (dt, hall, t) in raw_triples
+                    if dt in allowed
+                }
                 if first_iter:
                     print_debug_snippet(chunks)
-                    print("JSON 파싱 사용:", used_json, "/ 추출된 회차 수:", len(triples))
+                    print(f"추출 회차: 필터 전 {len(raw_triples)}건 → 대상 날짜만 {len(triples)}건")
 
                 new_triples = [
                     tr for tr in triples
                     if f"{tr[0]}|{tr[1]}|{tr[2]}" not in seen
                 ]
-                new_dates = sorted({tr[0] for tr in new_triples if tr[0]
-                                    and f"DATE:{tr[0]}" not in seen})
+                new_dates = sorted({tr[0] for tr in new_triples
+                                    if f"DATE:{tr[0]}" not in seen})
                 new_halls = sorted({tr[1] for tr in new_triples if tr[1]
                                     and f"HALL:{tr[1]}" not in seen})
 
@@ -445,7 +459,7 @@ def main() -> None:
                     send_telegram("\n\n".join(parts))
                     print(stamp, f"알림 전송: 새 회차 {len(new_triples)}건")
                 else:
-                    print(stamp, "키워드 있음, 변화 없음")
+                    print(stamp, "키워드 있음, 대상 날짜 변화 없음")
             else:
                 print(stamp, "키워드 없음")
         except Exception as e:
