@@ -13,14 +13,15 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  MOVIE_KEYWORD: "스파이더맨"                                  # 감시할 영화 제목 (공백·더빙 등 변형도 자동으로 잡힘)
-  THEATER_URL: "https://cgv.co.kr/cnm/movieBook/cinema"
-# CGV에서 극장 선택 후 복사한 주소
-  THEATER_NAME: "용산아이파크몰"                            
-# 주소에 극장 정보가 없을 때 페이지에서 눌러볼 극장 이름
-  CHECK_EVERY_SEC: "30"                                    # 확인 간격(초) — 너무 줄이면 차단 위험
+  # ▼▼▼ 여기만 수정하면 됩니다 ▼▼▼
+  MOVIE_KEYWORD: "스파이더맨"                              # 감시할 영화 (공백·더빙 등 변형도 자동으로 잡힘)
+  THEATER_URL: "https://cgv.co.kr/cnm/movieBook/cinema"    # CGV 예매 페이지
+  THEATER_NAME: "용산아이파크몰"                            # 페이지에서 선택할 극장 이름
+  TARGET_WEEKDAYS: "금,토,일"                              # 감시할 요일 (이번 주·다음 주)
+  CHECK_EVERY_SEC: "30"                                    # 확인 간격(초)
   CHAT_ID: "7731303031"                                    # 텔레그램 chat ID
   RUN_MINUTES: "225"
+  # ▲▲▲ 여기까지 ▲▲▲
 
 jobs:
   check:
@@ -38,6 +39,25 @@ jobs:
           pip install playwright requests
           playwright install --with-deps chromium
 
+      - name: Start state saver
+        run: |
+          git config user.name "cgv-watch-bot"
+          git config user.email "actions@users.noreply.github.com"
+          nohup bash -c '
+            for i in $(seq 1 500); do
+              sleep 30
+              if [ -f seen.json ]; then
+                git add seen.json 2>/dev/null || true
+                if ! git diff --cached --quiet 2>/dev/null; then
+                  git commit -q -m "seen 업데이트" 2>/dev/null || true
+                  git pull --rebase -q 2>/dev/null || true
+                  git push -q 2>/dev/null || true
+                fi
+              fi
+            done
+          ' > /dev/null 2>&1 &
+          echo "상태 자동 저장 시작 (30초마다)"
+
       - name: Watch CGV
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -46,7 +66,5 @@ jobs:
       - name: Save state
         if: always()
         run: |
-          git config user.name "cgv-watch-bot"
-          git config user.email "actions@users.noreply.github.com"
           git add seen.json || true
-          git diff --cached --quiet || (git commit -m "seen 업데이트" && git push)
+          git diff --cached --quiet || (git commit -q -m "seen 업데이트" && git pull --rebase -q && git push -q) || true
