@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""CGV 예매 오픈 감시 — 버전 9 (CGV 실제 필드 scnYmd/scnsrtTm 직접 파싱)
+"""CGV 예매 오픈 감시 — 버전 10 (상영 API 자동 탐지 + 날짜별 직접 호출)
 
 오늘은 제외하고, 이번 주와 다음 주 중 TARGET_WEEKDAYS(기본: 금,토,일)에
 해당하는 날짜 탭만 눌러 데이터를 수집·감시한다.
@@ -133,11 +133,24 @@ async def collect_text(dates: list, verbose: bool = False) -> list:
             ),
         )
 
+        api_hits = []
+
         async def grab(res):
             try:
                 ct = res.headers.get("content-type", "")
                 if ("json" in ct or "text" in ct) and len(chunks) < 400:
-                    chunks.append(await res.text())
+                    body = await res.text()
+                    chunks.append(body)
+                    if "scnYmd" in body or "scnsrtTm" in body:
+                        req = res.request
+                        post = None
+                        try:
+                            post = req.post_data
+                        except Exception:
+                            pass
+                        api_hits.append({
+                            "url": req.url, "method": req.method, "post": post,
+                        })
             except Exception:
                 pass
 
@@ -180,28 +193,50 @@ async def collect_text(dates: list, verbose: bool = False) -> list:
             if verbose:
                 print("클릭 성공:" if ok else "클릭 실패:", label)
 
-        # 날짜를 주소에 직접 넣어 재접속 (탭 클릭 실패 보완)
-        base = URL.split("?")[0]
-        for d in dates:
-            ymd = f"{d.year}{d.month:02d}{d.day:02d}"
-            for cand in (f"{base}?scnYmd={ymd}", f"{base}?date={ymd}"):
-                try:
-                    await page.goto(cand, wait_until="domcontentloaded", timeout=45000)
-                    await page.wait_for_timeout(4000)
-                except Exception:
-                    pass
+        # 상영 데이터 API를 찾았으면 날짜만 바꿔 직접 호출
+        if api_hits:
+            hit = api_hits[-1]
             if verbose:
-                print("날짜 직접 요청:", date_label(d))
-
-        try:
-            await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_timeout(5000)
-            for label in ("서울", THEATER_NAME):
-                if label:
-                    await try_click(label)
-                    await page.wait_for_timeout(2500)
-        except Exception:
-            pass
+                print("상영 API 발견:", hit["method"], hit["url"][:220])
+                if hit["post"]:
+                    print("요청 본문 샘플:", str(hit["post"])[:400])
+            today_ymd = f"{kst_now().year}{kst_now().month:02d}{kst_now().day:02d}"
+            for d in dates:
+                ymd = f"{d.year}{d.month:02d}{d.day:02d}"
+                new_url = re.sub(r"20\d{6}", ymd, hit["url"])
+                if new_url == hit["url"] and "=" in hit["url"]:
+                    sep = "&" if "?" in new_url else "?"
+                    new_url = f"{new_url}{sep}scnYmd={ymd}"
+                try:
+                    if hit["method"] == "POST" and hit["post"]:
+                        payload = str(hit["post"]).replace(today_ymd, ymd)
+                        got = await page.evaluate(
+                            """async ([u, b]) => {
+                                const r = await fetch(u, {
+                                    method: 'POST',
+                                    headers: {'Content-Type': 'application/json'},
+                                    body: b, credentials: 'include'});
+                                return await r.text();
+                            }""",
+                            [new_url, payload],
+                        )
+                    else:
+                        got = await page.evaluate(
+                            """async (u) => {
+                                const r = await fetch(u, {credentials: 'include'});
+                                return await r.text();
+                            }""",
+                            new_url,
+                        )
+                    if got:
+                        chunks.append(got)
+                        if verbose:
+                            print("API 직접 호출:", date_label(d), "응답", len(got), "자")
+                except Exception as e:
+                    if verbose:
+                        print("API 호출 실패:", date_label(d), type(e).__name__)
+        elif verbose:
+            print("상영 API를 찾지 못함 — 탭 클릭 방식만 사용")
 
         # 감시 대상 날짜 탭도 순서대로 눌러 데이터 수집
         for d in dates:
