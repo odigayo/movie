@@ -125,23 +125,39 @@ HALL_RE = re.compile(
 DATE_RE = re.compile(r"(\d{1,2}월\s?\d{1,2}일|\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}|\d{1,2}[.\-/]\d{1,2})")
 
 
-def extract_slots(text: str, positions: list) -> dict:
-    """키워드 주변에서 (날짜 시간) 키와 상영관 정보가 붙은 표시용 문구를 추출."""
-    items = {}
+def _valid_date(d: str) -> bool:
+    nums = re.findall(r"\d+", d)
+    if "월" in d:
+        m, day = int(nums[0]), int(nums[1])
+    elif len(nums) == 3:
+        m, day = int(nums[1]), int(nums[2])
+    else:
+        m, day = int(nums[0]), int(nums[1])
+    return 1 <= m <= 12 and 1 <= day <= 31
+
+
+def extract_slots(text: str, positions: list):
+    """키워드 주변에서 회차(날짜+시간), 날짜 목록, 상영관 목록을 추출."""
+    items, dates, halls = {}, set(), set()
     for p in positions:
         window = text[max(0, p - 600): p + 600]
+        w_halls = set(h.upper() for h in HALL_RE.findall(window))
+        halls |= w_halls
         times = TIME_RE.findall(window)
-        if not times:
-            continue
-        halls = sorted(set(h.upper() for h in HALL_RE.findall(window)))
         before = text[max(0, p - 3000): p]
-        date_matches = DATE_RE.findall(before) or DATE_RE.findall(window)
+        date_matches = [
+            d for d in (DATE_RE.findall(before) or DATE_RE.findall(window))
+            if _valid_date(d)
+        ]
         date = date_matches[-1] if date_matches else ""
+        if date:
+            dates.add(date)
+        hall_tag = "/".join(sorted(w_halls))
         for t in times:
             key = f"{date} {t}".strip()
-            label = key + (f" [{'/'.join(halls)}]" if halls else "")
+            label = key + (f" [{hall_tag}]" if hall_tag else "")
             items.setdefault(key, label)
-    return items
+    return items, dates, halls
 
 
 def load_seen() -> set:
@@ -179,23 +195,31 @@ def main() -> None:
             positions = find_keyword_positions(text)
             stamp = time.strftime("%H:%M:%S")
             if positions:
-                items = extract_slots(text, positions)
+                items, dates, halls = extract_slots(text, positions)
                 new_keys = [k for k in sorted(items) if k not in seen]
                 new_labels = [items[k] for k in new_keys]
+                new_dates = [d for d in sorted(dates) if f"DATE:{d}" not in seen]
+                new_halls = [h for h in sorted(halls) if f"HALL:{h}" not in seen]
                 if not items and "OPEN" not in seen:
                     seen.add("OPEN")
                     new_labels.append("예매 오픈 (회차 시간 미확인)")
-                if new_labels:
+                if new_labels or new_dates or new_halls:
                     seen.update(new_keys)
+                    seen.update(f"DATE:{d}" for d in new_dates)
+                    seen.update(f"HALL:{h}" for h in new_halls)
                     save_seen(seen)
-                    send_telegram(
-                        f"🎬 CGV 새 회차 오픈!\n영화: {MOVIE_RAW}\n\n"
-                        + "\n".join(new_labels)
-                        + "\n\n예매: https://cgv.co.kr"
-                    )
-                    print(stamp, "알림 전송:", new_labels)
+                    parts = [f"🎬 CGV 변화 감지!\n영화: {MOVIE_RAW}"]
+                    if new_dates:
+                        parts.append("🗓 새 날짜: " + ", ".join(new_dates))
+                    if new_halls:
+                        parts.append("🏟 새 상영관: " + ", ".join(new_halls))
+                    if new_labels:
+                        parts.append("⏰ 새 회차:\n" + "\n".join(new_labels))
+                    parts.append("예매: https://cgv.co.kr")
+                    send_telegram("\n\n".join(parts))
+                    print(stamp, "알림 전송:", new_dates, new_halls, new_labels)
                 else:
-                    print(stamp, "키워드 있음, 새 회차 없음")
+                    print(stamp, "키워드 있음, 변화 없음")
             else:
                 print(stamp, "키워드 없음")
         except Exception as e:
