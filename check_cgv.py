@@ -118,13 +118,30 @@ def find_keyword_positions(text: str) -> list:
     return positions
 
 
-def extract_slots(text: str, positions: list) -> set:
-    """키워드 주변(앞뒤 600자)에서 상영시간(HH:MM)을 추출."""
-    slots = set()
+HALL_RE = re.compile(
+    r"(IMAX|아이맥스|4DX|SCREENX|스크린X|DOLBY|돌비|골드클래스|템퍼시네마|리클라이너|프리미엄|\d{1,2}관)",
+    re.IGNORECASE,
+)
+DATE_RE = re.compile(r"(\d{1,2}월\s?\d{1,2}일|\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}|\d{1,2}[.\-/]\d{1,2})")
+
+
+def extract_slots(text: str, positions: list) -> dict:
+    """키워드 주변에서 (날짜 시간) 키와 상영관 정보가 붙은 표시용 문구를 추출."""
+    items = {}
     for p in positions:
         window = text[max(0, p - 600): p + 600]
-        slots.update(TIME_RE.findall(window))
-    return slots
+        times = TIME_RE.findall(window)
+        if not times:
+            continue
+        halls = sorted(set(h.upper() for h in HALL_RE.findall(window)))
+        before = text[max(0, p - 3000): p]
+        date_matches = DATE_RE.findall(before) or DATE_RE.findall(window)
+        date = date_matches[-1] if date_matches else ""
+        for t in times:
+            key = f"{date} {t}".strip()
+            label = key + (f" [{'/'.join(halls)}]" if halls else "")
+            items.setdefault(key, label)
+    return items
 
 
 def load_seen() -> set:
@@ -162,20 +179,21 @@ def main() -> None:
             positions = find_keyword_positions(text)
             stamp = time.strftime("%H:%M:%S")
             if positions:
-                slots = extract_slots(text, positions)
-                new_items = [s for s in sorted(slots) if s not in seen]
-                if not slots and "OPEN" not in seen:
-                    new_items.append("예매 오픈 (회차 시간 미확인)")
+                items = extract_slots(text, positions)
+                new_keys = [k for k in sorted(items) if k not in seen]
+                new_labels = [items[k] for k in new_keys]
+                if not items and "OPEN" not in seen:
                     seen.add("OPEN")
-                if new_items:
-                    seen.update(s for s in new_items if TIME_RE.fullmatch(s))
+                    new_labels.append("예매 오픈 (회차 시간 미확인)")
+                if new_labels:
+                    seen.update(new_keys)
                     save_seen(seen)
                     send_telegram(
                         f"🎬 CGV 새 회차 오픈!\n영화: {MOVIE_RAW}\n\n"
-                        + "\n".join(new_items)
+                        + "\n".join(new_labels)
                         + "\n\n예매: https://cgv.co.kr"
                     )
-                    print(stamp, "알림 전송:", new_items)
+                    print(stamp, "알림 전송:", new_labels)
                 else:
                     print(stamp, "키워드 있음, 새 회차 없음")
             else:
