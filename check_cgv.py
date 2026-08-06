@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
-"""CGV 예매 오픈 감시 — 버전 3 (진단 모드 포함)
+"""CGV 예매 오픈 감시 — 버전 5 (JSON 구조 파싱: 날짜·상영관·시간 정확 매칭)
 
-작업이 시작되면 약 3시간 45분 동안 계속 돌면서 CHECK_EVERY_SEC초마다
-CGV 페이지를 확인하고, 영화 키워드의 새 회차가 발견되는 즉시 텔레그램으로 알린다.
-제목 매칭은 공백·대소문자를 무시한 부분일치라서
-"스파이더맨" 으로 "스파이더 맨.", "스파이더맨(더빙)", "스파이더맨: 부제" 를 모두 잡는다.
-설정은 .github/workflows/watch.yml 에서 수정한다.
+네트워크로 오가는 JSON 데이터에서 영화가 언급된 항목을 찾아
+회차 단위로 (날짜, 상영관, 시간)을 정확히 추출한다.
+JSON 파싱이 실패하면 기존 텍스트 방식(시간만)으로 폴백.
+알림은 날짜 → 상영관별 시간으로 묶어서 보기 좋게 전송.
 """
 import asyncio
 import json
@@ -24,7 +23,15 @@ CHAT_ID = os.environ["CHAT_ID"].strip()
 CHECK_EVERY_SEC = int(os.environ.get("CHECK_EVERY_SEC", "30"))
 RUN_MINUTES = int(os.environ.get("RUN_MINUTES", "225"))
 STATE_FILE = "seen.json"
+
 TIME_RE = re.compile(r"(?<!\d)(?:[01]?\d|2[0-3]):[0-5]\d(?!\d)")
+HALL_RE = re.compile(
+    r"(IMAX|아이맥스|4DX|SCREENX|스크린X|DOLBY|돌비|골드클래스|템퍼시네마|리클라이너|프리미엄|씨네|\d{1,2}관)",
+    re.IGNORECASE,
+)
+TIME_KEY = re.compile(r"(time|tm)", re.I)
+DATE_KEY = re.compile(r"(date|ymd|day|dt)", re.I)
+HALL_KEY = re.compile(r"(scr|screen|theab|hall|room)", re.I)
 
 
 def _norm_char(ch: str) -> str:
@@ -32,9 +39,36 @@ def _norm_char(ch: str) -> str:
     return low if len(low) == 1 else ch
 
 
-MOVIE_NORM = "".join(_norm_char(c) for c in MOVIE_RAW if not c.isspace())
+def norm(s: str) -> str:
+    return "".join(_norm_char(c) for c in s if not c.isspace())
 
 
+MOVIE_NORM = norm(MOVIE_RAW)
+
+
+def kw_in(s: str) -> bool:
+    return MOVIE_NORM in norm(s)
+
+
+def find_keyword_positions(text: str) -> list:
+    norm_chars, idx_map = [], []
+    for i, ch in enumerate(text):
+        if ch.isspace():
+            continue
+        norm_chars.append(_norm_char(ch))
+        idx_map.append(i)
+    norm_text = "".join(norm_chars)
+    positions, start = [], 0
+    while True:
+        pos = norm_text.find(MOVIE_NORM, start)
+        if pos < 0:
+            break
+        positions.append(idx_map[pos])
+        start = pos + 1
+    return positions
+
+
+# ---------- 텔레그램 ----------
 def send_telegram(text: str) -> None:
     for attempt in range(3):
         try:
@@ -47,9 +81,9 @@ def send_telegram(text: str) -> None:
             if r.status_code == 200:
                 print("텔레그램 전송 성공")
             elif r.status_code == 401:
-                print("텔레그램 실패(401): 토큰이 잘못됨 — Secrets의 TELEGRAM_TOKEN 재등록 필요 /", body)
+                print("텔레그램 실패(401): 토큰이 잘못됨 — Secrets 재등록 필요 /", body)
             elif r.status_code in (400, 403):
-                print("텔레그램 실패: chat_id가 잘못됐거나 봇에게 /start를 안 보낸 상태 /", body)
+                print("텔레그램 실패: chat_id 문제 또는 /start 미전송 /", body)
             else:
                 print("텔레그램 실패:", r.status_code, body)
             return
@@ -58,8 +92,8 @@ def send_telegram(text: str) -> None:
             time.sleep(3)
 
 
-async def collect_text(verbose: bool = False) -> str:
-    """페이지를 렌더링하면서 오가는 데이터(JSON 응답 + 화면 텍스트)를 전부 수집."""
+# ---------- 페이지 수집 ----------
+async def collect_text(verbose: bool = False) -> list:
     chunks = []
     async with async_playwright() as p:
         browser = await p.chromium.launch()
@@ -81,26 +115,51 @@ async def collect_text(verbose: bool = False) -> str:
 
         page.on("response", lambda res: asyncio.create_task(grab(res)))
         await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(6000)
+        await page.wait_for_timeout(8000)
         if verbose:
             print("접속 후 URL:", page.url)
             try:
                 print("페이지 제목:", await page.title())
             except Exception:
                 pass
+            try:
+                labels = await page.eval_on_selector_all(
+                    "button, a, li, [role=button]",
+                    "els => [...new Set(els.map(e => (e.innerText || '').trim())"
+                    ".filter(t => t && t.length <= 15))].slice(0, 60)",
+                )
+                print("클릭 가능한 항목들:", labels)
+            except Exception:
+                pass
 
-        # 지역/극장 선택이 필요한 화면일 수 있어 순서대로 눌러본다 (실패해도 무시)
+        async def try_click(label):
+            candidates = [
+                page.get_by_text(label, exact=False).first,
+                page.locator(f"xpath=//*[contains(text(), '{label}')]").first,
+            ]
+            for loc in candidates:
+                try:
+                    await loc.scroll_into_view_if_needed(timeout=3000)
+                except Exception:
+                    pass
+                try:
+                    await loc.click(timeout=4000)
+                    return True
+                except Exception:
+                    try:
+                        await loc.click(timeout=3000, force=True)
+                        return True
+                    except Exception:
+                        continue
+            return False
+
         for label in ("서울", THEATER_NAME):
             if not label:
                 continue
-            try:
-                await page.get_by_text(label, exact=False).first.click(timeout=4000)
-                await page.wait_for_timeout(3000)
-                if verbose:
-                    print("클릭 성공:", label)
-            except Exception:
-                if verbose:
-                    print("클릭 실패:", label)
+            ok = await try_click(label)
+            await page.wait_for_timeout(3000)
+            if verbose:
+                print("클릭 성공:" if ok else "클릭 실패:", label)
 
         try:
             await page.mouse.wheel(0, 3000)
@@ -112,75 +171,148 @@ async def collect_text(verbose: bool = False) -> str:
             body = await page.evaluate("document.body.innerText")
             chunks.append(body)
             if verbose:
-                preview = " ".join(body.split())[:500]
+                preview = " ".join(body.split())[:400]
                 print("화면 텍스트 미리보기:", preview if preview else "(비어 있음)")
         except Exception:
             pass
         await browser.close()
-    return "\n".join(chunks)
+    return chunks
 
 
-def find_keyword_positions(text: str) -> list:
-    """공백·대소문자 무시 부분일치로 키워드 위치(원본 인덱스)를 찾는다."""
-    norm_chars, idx_map = [], []
-    for i, ch in enumerate(text):
-        if ch.isspace():
+# ---------- JSON 구조 파싱 ----------
+def norm_time_kv(key: str, val):
+    sv = str(val).strip()
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})(:\d{2})?", sv)
+    if m and int(m.group(1)) < 24:
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
+    if TIME_KEY.search(key):
+        m = re.fullmatch(r"(\d{2})(\d{2})(\d{2})?", sv)
+        if m and int(m.group(1)) < 24 and int(m.group(2)) < 60:
+            return f"{m.group(1)}:{m.group(2)}"
+    return None
+
+
+def norm_date_kv(key: str, val):
+    sv = str(val).strip()
+    if not (DATE_KEY.search(key) or re.fullmatch(r"20\d{6}", sv)):
+        return None
+    m = re.fullmatch(r"(20\d{2})[-./]?(\d{1,2})[-./]?(\d{1,2})", sv)
+    if m and 1 <= int(m.group(2)) <= 12 and 1 <= int(m.group(3)) <= 31:
+        return f"{int(m.group(2))}/{int(m.group(3))}"
+    return None
+
+
+def norm_hall_kv(key: str, val):
+    if not isinstance(val, str):
+        return None
+    sv = val.strip()
+    if not sv or len(sv) > 14:
+        return None
+    if HALL_RE.search(sv):
+        return sv
+    if HALL_KEY.search(key) and re.search(r"[가-힣A-Za-z]", sv):
+        return sv
+    return None
+
+
+def field_scan(dct: dict):
+    t = dt = hall = None
+    for k, v in dct.items():
+        if not isinstance(v, (str, int)):
             continue
-        norm_chars.append(_norm_char(ch))
-        idx_map.append(i)
-    norm_text = "".join(norm_chars)
-    positions, start = [], 0
-    while True:
-        pos = norm_text.find(MOVIE_NORM, start)
-        if pos < 0:
-            break
-        positions.append(idx_map[pos])
-        start = pos + 1
-    return positions
+        if t is None:
+            t = norm_time_kv(k, v)
+        if dt is None:
+            dt = norm_date_kv(k, v)
+        if hall is None:
+            hall = norm_hall_kv(k, v)
+    return t, dt, hall
 
 
-HALL_RE = re.compile(
-    r"(IMAX|아이맥스|4DX|SCREENX|스크린X|DOLBY|돌비|골드클래스|템퍼시네마|리클라이너|프리미엄|\d{1,2}관)",
-    re.IGNORECASE,
-)
-DATE_RE = re.compile(r"(\d{1,2}월\s?\d{1,2}일|\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}|\d{1,2}[.\-/]\d{1,2})")
+def collect_screenings(data) -> set:
+    matched = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            own = " ".join(str(v) for v in node.values() if isinstance(v, str))
+            if own and kw_in(own):
+                matched.append(node)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(data)
+    triples = set()
+
+    def units_of(d):
+        us = []
+
+        def rec(x):
+            if isinstance(x, dict):
+                if any(
+                    isinstance(v, (str, int)) and norm_time_kv(k, v)
+                    for k, v in x.items()
+                ):
+                    us.append(x)
+                for v in x.values():
+                    rec(v)
+            elif isinstance(x, list):
+                for v in x:
+                    rec(v)
+
+        rec(d)
+        return us
+
+    for d in matched:
+        p_t, p_dt, p_hall = field_scan(d)
+        for u in units_of(d):
+            t, dt, hall = field_scan(u)
+            if t is None:
+                continue
+            triples.add((dt or p_dt or "", hall or p_hall or "", t))
+        if not units_of(d) and p_t:
+            triples.add((p_dt or "", p_hall or "", p_t))
+
+    # 영화 코드로 상영 항목을 찾는 2차 시도
+    if not triples and matched:
+        codes = set()
+        for d in matched:
+            for k, v in d.items():
+                if isinstance(v, (str, int)) and re.search(r"(mov|film)", k, re.I) \
+                        and re.search(r"(no|cd|code|id)$", k, re.I):
+                    codes.add(str(v))
+        if codes:
+            def walk_all(node):
+                if isinstance(node, dict):
+                    vals = {str(v) for v in node.values() if isinstance(v, (str, int))}
+                    if vals & codes:
+                        t, dt, hall = field_scan(node)
+                        if t:
+                            triples.add((dt or "", hall or "", t))
+                    for v in node.values():
+                        walk_all(v)
+                elif isinstance(node, list):
+                    for v in node:
+                        walk_all(v)
+            walk_all(data)
+    return triples
 
 
-def _valid_date(d: str) -> bool:
-    nums = re.findall(r"\d+", d)
-    if "월" in d:
-        m, day = int(nums[0]), int(nums[1])
-    elif len(nums) == 3:
-        m, day = int(nums[1]), int(nums[2])
-    else:
-        m, day = int(nums[0]), int(nums[1])
-    return 1 <= m <= 12 and 1 <= day <= 31
+def print_debug_snippet(chunks):
+    for c in chunks:
+        if c.lstrip()[:1] in "[{" and kw_in(c):
+            pos_list = find_keyword_positions(c)
+            if pos_list:
+                p = pos_list[0]
+                sample = c[max(0, p - 200): p + 600].replace("\n", " ")
+                print("JSON 컨텍스트 샘플:", sample[:800])
+                return
+    print("JSON 컨텍스트 샘플: (키워드가 포함된 JSON 응답 없음)")
 
 
-def extract_slots(text: str, positions: list):
-    """키워드 주변에서 회차(날짜+시간), 날짜 목록, 상영관 목록을 추출."""
-    items, dates, halls = {}, set(), set()
-    for p in positions:
-        window = text[max(0, p - 600): p + 600]
-        w_halls = set(h.upper() for h in HALL_RE.findall(window))
-        halls |= w_halls
-        times = TIME_RE.findall(window)
-        before = text[max(0, p - 3000): p]
-        date_matches = [
-            d for d in (DATE_RE.findall(before) or DATE_RE.findall(window))
-            if _valid_date(d)
-        ]
-        date = date_matches[-1] if date_matches else ""
-        if date:
-            dates.add(date)
-        hall_tag = "/".join(sorted(w_halls))
-        for t in times:
-            key = f"{date} {t}".strip()
-            label = key + (f" [{hall_tag}]" if hall_tag else "")
-            items.setdefault(key, label)
-    return items, dates, halls
-
-
+# ---------- 상태 ----------
 def load_seen() -> set:
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding="utf-8") as f:
@@ -193,6 +325,23 @@ def save_seen(seen: set) -> None:
         json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
 
 
+def format_grouped(triples) -> str:
+    by_date = {}
+    for dt, hall, t in triples:
+        by_date.setdefault(dt or "날짜 미확인", {}).setdefault(hall or "상영관 미확인", set()).add(t)
+    lines = []
+    for dt in sorted(by_date):
+        lines.append(f"📅 {dt}")
+        for hall in sorted(by_date[dt]):
+            times = ", ".join(sorted(by_date[dt][hall]))
+            lines.append(f" · {hall}: {times}")
+    msg = "\n".join(lines)
+    if len(msg) > 3300:
+        msg = msg[:3300] + "\n…(너무 길어 일부 생략)"
+    return msg
+
+
+# ---------- 메인 ----------
 def main() -> None:
     first_run = not os.path.exists(STATE_FILE)
     seen = load_seen()
@@ -200,11 +349,11 @@ def main() -> None:
     if first_run:
         send_telegram(
             f"✅ CGV 감시 시작!\n영화: {MOVIE_RAW}\n"
-            f"약 {CHECK_EVERY_SEC}초 간격으로 계속 확인하다가 회차가 열리면 바로 알릴게요."
+            f"약 {CHECK_EVERY_SEC}초 간격으로 계속 확인하다가 변화가 생기면 바로 알릴게요."
         )
         save_seen(seen)
     else:
-        send_telegram(f"🔎 CGV 감시 작동 중 — {MOVIE_RAW} (감시 작업이 새로 시작될 때마다 오는 확인 메시지예요)")
+        send_telegram(f"🔎 CGV 감시 작동 중 — {MOVIE_RAW} (감시 작업 재시작 알림)")
 
     deadline = time.time() + RUN_MINUTES * 60
     print(f"감시 루프 시작: '{MOVIE_RAW}' / {CHECK_EVERY_SEC}초 간격 / {RUN_MINUTES}분간")
@@ -212,22 +361,47 @@ def main() -> None:
     loop_no = 0
     while time.time() < deadline:
         t0 = time.time()
+        first_iter = loop_no == 0
         try:
-            text = asyncio.run(collect_text(verbose=(loop_no == 0)))
+            chunks = asyncio.run(collect_text(verbose=first_iter))
             loop_no += 1
-            positions = find_keyword_positions(text)
+            full_text = "\n".join(chunks)
+            positions = find_keyword_positions(full_text)
             stamp = time.strftime("%H:%M:%S")
+
             if positions:
-                items, dates, halls = extract_slots(text, positions)
-                new_keys = [k for k in sorted(items) if k not in seen]
-                new_labels = [items[k] for k in new_keys]
-                new_dates = [d for d in sorted(dates) if f"DATE:{d}" not in seen]
-                new_halls = [h for h in sorted(halls) if f"HALL:{h}" not in seen]
-                if not items and "OPEN" not in seen:
-                    seen.add("OPEN")
-                    new_labels.append("예매 오픈 (회차 시간 미확인)")
-                if new_labels or new_dates or new_halls:
-                    seen.update(new_keys)
+                triples = set()
+                for c in chunks:
+                    if c.lstrip()[:1] not in "[{" or not kw_in(c):
+                        continue
+                    try:
+                        data = json.loads(c)
+                    except Exception:
+                        continue
+                    triples |= collect_screenings(data)
+                used_json = bool(triples)
+
+                if not triples:  # 폴백: 텍스트 창에서 시간만
+                    for p in positions:
+                        window = full_text[max(0, p - 600): p + 600]
+                        for t in TIME_RE.findall(window):
+                            triples.add(("", "", t))
+
+                if first_iter:
+                    print_debug_snippet(chunks)
+                    print("JSON 파싱 사용:", used_json, "/ 추출된 회차 수:", len(triples))
+
+                new_triples = [
+                    tr for tr in triples
+                    if f"{tr[0]}|{tr[1]}|{tr[2]}" not in seen
+                ]
+                new_dates = sorted({tr[0] for tr in new_triples if tr[0]
+                                    and f"DATE:{tr[0]}" not in seen})
+                new_halls = sorted({tr[1] for tr in new_triples if tr[1]
+                                    and f"HALL:{tr[1]}" not in seen})
+
+                if new_triples:
+                    seen.update(f"{a}|{b}|{c2}" for a, b, c2 in new_triples)
                     seen.update(f"DATE:{d}" for d in new_dates)
                     seen.update(f"HALL:{h}" for h in new_halls)
                     save_seen(seen)
@@ -236,11 +410,10 @@ def main() -> None:
                         parts.append("🗓 새 날짜: " + ", ".join(new_dates))
                     if new_halls:
                         parts.append("🏟 새 상영관: " + ", ".join(new_halls))
-                    if new_labels:
-                        parts.append("⏰ 새 회차:\n" + "\n".join(new_labels))
+                    parts.append("⏰ 새 회차:\n" + format_grouped(new_triples))
                     parts.append("예매: https://cgv.co.kr")
                     send_telegram("\n\n".join(parts))
-                    print(stamp, "알림 전송:", new_dates, new_halls, new_labels)
+                    print(stamp, f"알림 전송: 새 회차 {len(new_triples)}건")
                 else:
                     print(stamp, "키워드 있음, 변화 없음")
             else:
