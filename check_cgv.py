@@ -81,18 +81,39 @@ async def collect_text() -> str:
 
         page.on("response", lambda res: asyncio.create_task(grab(res)))
         await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(5000)
-
-        # 주소에 극장 정보가 없을 경우, 페이지에서 극장 이름을 눌러본다 (실패해도 무시)
-        if THEATER_NAME:
+        await page.wait_for_timeout(6000)
+        if verbose:
+            print("접속 후 URL:", page.url)
             try:
-                await page.get_by_text(THEATER_NAME, exact=False).first.click(timeout=4000)
-                await page.wait_for_timeout(4000)
+                print("페이지 제목:", await page.title())
             except Exception:
                 pass
 
+        # 지역/극장 선택이 필요한 화면일 수 있어 순서대로 눌러본다 (실패해도 무시)
+        for label in ("서울", THEATER_NAME):
+            if not label:
+                continue
+            try:
+                await page.get_by_text(label, exact=False).first.click(timeout=4000)
+                await page.wait_for_timeout(3000)
+                if verbose:
+                    print("클릭 성공:", label)
+            except Exception:
+                if verbose:
+                    print("클릭 실패:", label)
+
         try:
-            chunks.append(await page.evaluate("document.body.innerText"))
+            await page.mouse.wheel(0, 3000)
+            await page.wait_for_timeout(2000)
+        except Exception:
+            pass
+
+        try:
+            body = await page.evaluate("document.body.innerText")
+            chunks.append(body)
+            if verbose:
+                preview = " ".join(body.split())[:500]
+                print("화면 텍스트 미리보기:", preview if preview else "(비어 있음)")
         except Exception:
             pass
         await browser.close()
