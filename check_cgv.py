@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""CGV 예매 오픈 감시 — 버전 5 (JSON 구조 파싱: 날짜·상영관·시간 정확 매칭)
+"""CGV 예매 오픈 감시 — 버전 6 (일주일치 날짜 순회 + JSON 구조 파싱)
 
 네트워크로 오가는 JSON 데이터에서 영화가 언급된 항목을 찾아
 회차 단위로 (날짜, 상영관, 시간)을 정확히 추출한다.
@@ -8,6 +8,7 @@ JSON 파싱이 실패하면 기존 텍스트 방식(시간만)으로 폴백.
 """
 import asyncio
 import json
+from datetime import datetime, timedelta
 import os
 import re
 import time
@@ -160,6 +161,35 @@ async def collect_text(verbose: bool = False) -> list:
             await page.wait_for_timeout(3000)
             if verbose:
                 print("클릭 성공:" if ok else "클릭 실패:", label)
+
+        # 내일부터 (DAYS_AHEAD-1)일치 날짜 탭을 순서대로 눌러 데이터 수집
+        days_ahead = int(os.environ.get("DAYS_AHEAD", "7"))
+        kst_today = datetime.utcnow() + timedelta(hours=9)
+        for i in range(1, days_ahead):
+            day = (kst_today + timedelta(days=i)).day
+            try:
+                clicked = await page.evaluate(
+                    """(day) => {
+                        const els = [...document.querySelectorAll('button, li, a, [role=button], span, div')];
+                        const cands = els.filter(e => {
+                            const t = (e.innerText || '').trim().replace(/\\s+/g, '');
+                            if (!t || t.length > 4) return false;
+                            const digits = t.replace(/[^0-9]/g, '');
+                            return digits === String(day) && /^[\uc77c\uc6d4\ud654\uc218\ubaa9\uae08\ud1a0]?\\d{1,2}[\uc77c\uc6d4\ud654\uc218\ubaa9\uae08\ud1a0]?$/.test(t);
+                        });
+                        if (!cands.length) return false;
+                        cands.sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
+                        cands[0].click();
+                        return true;
+                    }""",
+                    day,
+                )
+                await page.wait_for_timeout(3500)
+                if verbose:
+                    print("날짜 탭 클릭:", day, "성공" if clicked else "실패")
+            except Exception as e:
+                if verbose:
+                    print("날짜 탭 클릭 오류:", day, type(e).__name__)
 
         try:
             await page.mouse.wheel(0, 3000)
