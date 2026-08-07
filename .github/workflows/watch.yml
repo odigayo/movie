@@ -2,49 +2,69 @@ name: CGV Watch
 
 on:
   schedule:
-    - cron: "0 */4 * * *"   # 4시간마다 새 작업 시작 (작업 하나가 3시간 45분간 계속 감시)
-  workflow_dispatch:         # Actions 탭에서 수동 실행 버튼
+    - cron: "*/30 * * * *"   # 30분마다 점검 (이미 감시 중이면 새 작업은 즉시 종료)
+  workflow_dispatch:          # Actions 탭에서 수동 실행 버튼
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: cgv-watch
-  cancel-in-progress: true
+  cancel-in-progress: false   # 돌고 있는 감시를 끊지 않는다
 
 env:
   # ▼▼▼ 여기만 수정하면 됩니다 ▼▼▼
-  MOVIE_KEYWORD: "스파이더맨"                              # 감시할 영화 (공백·더빙 등 변형도 자동으로 잡힘)
+  MOVIE_KEYWORD: "스파이더맨,오디세이"                        # 감시할 영화들 — 쉼표로 여러 개
   THEATER_URL: "https://cgv.co.kr/cnm/movieBook/cinema"    # CGV 예매 페이지
   THEATER_NAME: "용산아이파크몰"                            # 페이지에서 선택할 극장 이름
   TARGET_WEEKDAYS: "금,토,일"                              # 감시할 요일 (이번 주·다음 주)
+  ONLY_SPECIAL_HALLS: "true"                               # true면 일반관 제외, 특별관만 알림
   CHECK_EVERY_SEC: "30"                                    # 확인 간격(초)
   CHAT_ID: "7731303031"                                    # 텔레그램 chat ID
-  RUN_MINUTES: "225"
+  RUN_MINUTES: "300"                                       # 한 작업당 감시 시간(분)
   # ▲▲▲ 여기까지 ▲▲▲
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 250
+    timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
 
+      # 이미 감시 중인 작업이 있으면 이번 작업은 조용히 종료 (중복 방지)
+      - name: Check if already running
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          COUNT=$(gh run list --workflow "${{ github.workflow }}" --status in_progress \
+                    --json databaseId --jq 'length' 2>/dev/null || echo 1)
+          if [ "$COUNT" -gt 1 ]; then
+            echo "이미 감시 중인 작업이 있어 이번 실행은 건너뜁니다."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip != 'true'
         with:
           python-version: "3.12"
 
       - name: Install
+        if: steps.guard.outputs.skip != 'true'
         run: |
           pip install playwright requests
           playwright install --with-deps chromium
 
       - name: Start state saver
+        if: steps.guard.outputs.skip != 'true'
         run: |
           git config user.name "cgv-watch-bot"
           git config user.email "actions@users.noreply.github.com"
           nohup bash -c '
-            for i in $(seq 1 500); do
+            for i in $(seq 1 700); do
               sleep 30
               if [ -f seen.json ]; then
                 git add seen.json 2>/dev/null || true
@@ -59,12 +79,23 @@ jobs:
           echo "상태 자동 저장 시작 (30초마다)"
 
       - name: Watch CGV
+        if: steps.guard.outputs.skip != 'true'
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         run: python -u check_cgv.py
 
       - name: Save state
-        if: always()
+        if: always() && steps.guard.outputs.skip != 'true'
         run: |
           git add seen.json || true
           git diff --cached --quiet || (git commit -q -m "seen 업데이트" && git pull --rebase -q && git push -q) || true
+
+      # 작업이 어떻게 끝나든(성공·실패·취소) 다음 감시를 즉시 이어서 시작
+      - name: Chain next run
+        if: always() && steps.guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sleep 10
+          gh workflow run "${{ github.workflow }}" --ref "${{ github.ref_name }}" || true
+          echo "다음 감시 작업을 예약했습니다."
